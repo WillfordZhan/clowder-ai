@@ -114,9 +114,28 @@ export interface WorktreeEntry {
   head: string;
 }
 
+function isMissingGitRepositoryError(error: unknown): boolean {
+  const err = error as { code?: unknown; stderr?: unknown; message?: unknown };
+  const stderr = typeof err.stderr === 'string' ? err.stderr : '';
+  const message = typeof err.message === 'string' ? err.message : '';
+  return (
+    err.code === 128 &&
+    (stderr.includes('not a git repository') || message.includes('not a git repository'))
+  );
+}
+
 export async function listWorktrees(repoRoot?: string): Promise<WorktreeEntry[]> {
   const cwd = repoRoot ?? process.cwd();
-  const { stdout } = await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd });
+  let stdout = '';
+  try {
+    const result = await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd });
+    stdout = result.stdout;
+  } catch (error) {
+    // 桌面打包环境的 process.cwd() 指向 App 资源目录，不一定是 git 仓库。
+    // 未显式指定 repoRoot 时降级为空列表，后续由 linked roots / registry 解析外部项目。
+    if (!repoRoot && isMissingGitRepositoryError(error)) return [];
+    throw error;
+  }
   const entries: WorktreeEntry[] = [];
   let current: Partial<WorktreeEntry> = {};
 
@@ -150,18 +169,19 @@ export async function listWorktrees(repoRoot?: string): Promise<WorktreeEntry[]>
 }
 
 export async function getWorktreeRoot(worktreeId: string, repoRoot?: string): Promise<string> {
-  const entries = await listWorktrees(repoRoot);
-  const entry = entries.find((e) => e.id === worktreeId);
-  if (entry) return entry.root;
+  // 外部项目的 worktreeId 由 /api/workspace/worktrees?repoRoot=... 注册。
+  // 先查注册表，避免桌面 App 自身不是 git 仓库时阻断文件树、diff、终端等后续接口。
+  const registeredRoot = worktreeRegistry.get(worktreeId);
+  if (registeredRoot) return registeredRoot;
 
   // Check linked roots (async to include config file)
   const linked = await getLinkedRootsAsync();
   const linkedEntry = linked.find((r) => r.id === worktreeId);
   if (linkedEntry) return linkedEntry.root;
 
-  // Check in-memory registry (populated by /worktrees?repoRoot= calls)
-  const registeredRoot = worktreeRegistry.get(worktreeId);
-  if (registeredRoot) return registeredRoot;
+  const entries = await listWorktrees(repoRoot);
+  const entry = entries.find((e) => e.id === worktreeId);
+  if (entry) return entry.root;
 
   throw new WorkspaceSecurityError(`Worktree not found: ${worktreeId}`, 'NOT_FOUND');
 }
@@ -173,17 +193,17 @@ export async function getWorktreeRoot(worktreeId: string, repoRoot?: string): Pr
 export async function resolveWorktreeIdByPath(dirPath: string, repoRoot?: string): Promise<string> {
   const resolved = resolve(dirPath);
 
-  const entries = await listWorktrees(repoRoot);
-  const entry = entries.find((e) => e.root === resolved);
-  if (entry) return entry.id;
+  for (const [id, root] of worktreeRegistry.entries()) {
+    if (root === resolved) return id;
+  }
 
   const linked = await getLinkedRootsAsync();
   const linkedEntry = linked.find((r) => r.root === resolved);
   if (linkedEntry) return linkedEntry.id;
 
-  for (const [id, root] of worktreeRegistry.entries()) {
-    if (root === resolved) return id;
-  }
+  const entries = await listWorktrees(repoRoot);
+  const entry = entries.find((e) => e.root === resolved);
+  if (entry) return entry.id;
 
   throw new WorkspaceSecurityError(`No worktree found for path: ${dirPath}`, 'NOT_FOUND');
 }

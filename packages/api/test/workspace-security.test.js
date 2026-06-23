@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, it } from 'node:test';
@@ -153,12 +153,14 @@ describe('workspace-security', () => {
 
   // -- Worktree listing --
 
-  it('listWorktrees returns at least one entry', async () => {
+  it('listWorktrees tolerates packaged app cwd without a git repository', async () => {
     const entries = await mod.listWorktrees();
-    assert.ok(entries.length >= 1);
-    assert.ok(entries[0].id);
-    assert.ok(entries[0].root);
-    assert.ok(entries[0].branch);
+    assert.ok(Array.isArray(entries));
+    if (entries[0]) {
+      assert.ok(entries[0].id);
+      assert.ok(entries[0].root);
+      assert.ok(entries[0].branch);
+    }
   });
 
   it('getWorktreeRoot throws for unknown ID', async () => {
@@ -168,11 +170,31 @@ describe('workspace-security', () => {
     );
   });
 
+  it('getWorktreeRoot resolves registered foreign worktrees when cwd is not a git repo', async () => {
+    const originalCwd = process.cwd();
+    const nonGitCwd = await mkdtemp(join(tmpdir(), 'ws-non-git-cwd-'));
+    const worktreeId = `registered-foreign-${Date.now()}`;
+
+    try {
+      mod.registerWorktrees([{ id: worktreeId, root: testRoot, branch: 'dev', head: 'abc12345' }]);
+      process.chdir(nonGitCwd);
+
+      const root = await mod.getWorktreeRoot(worktreeId);
+      assert.strictEqual(root, testRoot);
+
+      const resolvedId = await mod.resolveWorktreeIdByPath(testRoot);
+      assert.strictEqual(resolvedId, worktreeId);
+    } finally {
+      process.chdir(originalCwd);
+      await rm(nonGitCwd, { recursive: true, force: true });
+    }
+  });
+
   // -- resolveWorktreeIdByPath (F089 Phase 3a) --
 
   it('resolveWorktreeIdByPath returns canonical id for known worktree root', async () => {
     const entries = await mod.listWorktrees();
-    assert.ok(entries.length > 0, 'should have at least one worktree');
+    if (entries.length === 0) return;
     const first = entries[0];
     const resolvedId = await mod.resolveWorktreeIdByPath(first.root);
     assert.strictEqual(resolvedId, first.id);

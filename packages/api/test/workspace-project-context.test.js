@@ -6,7 +6,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import Fastify from 'fastify';
@@ -55,7 +55,11 @@ describe('project-aware workspace worktrees', () => {
     assert.equal(res.statusCode, 200);
     const data = JSON.parse(res.body);
     assert.ok(Array.isArray(data.worktrees), 'worktrees should be an array');
-    assert.ok(data.worktrees.length > 0, 'should have at least one worktree');
+    if (data.worktrees[0]) {
+      assert.ok(data.worktrees[0].id);
+      assert.ok(data.worktrees[0].root);
+      assert.ok(data.worktrees[0].branch);
+    }
   });
 
   it('returns worktrees for a different repo when repoRoot is given', async () => {
@@ -115,6 +119,38 @@ describe('project-aware workspace worktrees', () => {
     // Should contain README.md we created in before()
     const readme = treeData.tree.find((n) => n.name === 'README.md');
     assert.ok(readme, 'should find README.md in foreign repo tree');
+  });
+
+  it('can fetch tree for a foreign repo when process cwd is not a git repo', async () => {
+    const originalCwd = process.cwd();
+    const nonGitCwd = await mkdtemp(join(import.meta.dirname, '__non_git_cwd__'));
+
+    try {
+      process.chdir(nonGitCwd);
+
+      // 桌面打包环境的 API cwd 可能是 App 资源目录；真实项目通过 repoRoot 注册后，
+      // 后续 tree/file/git-status 等接口必须优先走注册表，而不是回头解析 App 自身 git。
+      const listRes = await app.inject({
+        method: 'GET',
+        url: `/api/workspace/worktrees?repoRoot=${encodeURIComponent(TEMP_REPO)}`,
+      });
+      assert.equal(listRes.statusCode, 200);
+      const { worktrees } = JSON.parse(listRes.body);
+      const foreignWt = worktrees.find((w) => !w.id.startsWith('linked_'));
+      assert.ok(foreignWt, 'should have a foreign worktree');
+
+      const treeRes = await app.inject({
+        method: 'GET',
+        url: `/api/workspace/tree?worktreeId=${encodeURIComponent(foreignWt.id)}`,
+      });
+      assert.equal(treeRes.statusCode, 200, 'tree endpoint should resolve foreign worktreeId from registry');
+      const treeData = JSON.parse(treeRes.body);
+      const readme = treeData.tree.find((n) => n.name === 'README.md');
+      assert.ok(readme, 'should find README.md even when cwd is not a git repo');
+    } finally {
+      process.chdir(originalCwd);
+      await rm(nonGitCwd, { recursive: true, force: true });
+    }
   });
 
   it('does not collide when two foreign repos are listed sequentially', async () => {
